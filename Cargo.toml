@@ -1,0 +1,27 @@
+[package]
+name = "helios-proof-relayer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.45.0", features = [
+    "sync",
+    "macros",
+    "io-util",
+    "rt",
+    "time",
+], default-features = false }
+hex = { version = "0.4", default-features = false }
+anyhow = { version = "1.0.83", default-features = false }
+serde = { version = "1.0.219", default-features = false, features = [
+    "alloc",
+    "derive",
+] }
+serde_json = { version = "1.0.140", default-features = false, features = [
+    "alloc",
+] }
+borsh = { version = "1.5.5", features = ["derive"], default-features = false }
+sp1-sdk = { git = "https://github.com/timewave-computer/sp1", branch = "jonas/fix-4.1.7-syscall", default-features = false, features = [
+    "native-gnark",
+] }
+reqwest = { version = "0.11", features = ["json"], default-features = false }
