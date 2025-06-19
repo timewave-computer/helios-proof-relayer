@@ -1,4 +1,4 @@
-# Helios Proof Relayer
+# Lightwave Relayer
 
 A Rust application that relays proofs to a registry and performs health checks on light client data.
 
