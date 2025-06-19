@@ -1,3 +1,4 @@
+use crate::config::API_PORT;
 use crate::db::Database;
 use axum::{
     Router,
@@ -79,8 +80,8 @@ async fn get_health_check(State(state): State<Arc<AppState>>) -> impl IntoRespon
 }
 
 pub async fn start_api_server(router: Router) -> Result<(), Box<dyn std::error::Error>> {
-    // Get server port from environment or use default
-    let port = std::env::var("API_PORT").unwrap_or_else(|_| "17400".to_string());
+    // Get server port from environment or use default from config
+    let port = std::env::var("API_PORT").unwrap_or_else(|_| API_PORT.to_string());
     let addr = format!("0.0.0.0:{}", port);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

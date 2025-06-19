@@ -7,6 +7,8 @@ pub const LIGHT_CLIENT_VK: &str =
 pub const REGISTRY_ENDPOINT: &str =
     "http://prover.timewave.computer:37281/api/registry/domain/ethereum-alpha";
 
+pub const API_PORT: &str = "17400";
+
 pub const LIGHT_CLIENT_MODE: MODE = MODE::HELIOS;
 
 #[allow(unused)]
