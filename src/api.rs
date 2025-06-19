@@ -40,10 +40,9 @@ async fn get_health_check(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
     match state.db.get_latest_health_check() {
         Ok(Some(health_data)) => {
-            // Check if the timestamp is less than 2 hours old
             let now = chrono::Utc::now();
-            let two_hours_ago = now - chrono::Duration::hours(2);
-            let status = if health_data.timestamp > two_hours_ago {
+            let threshold = now - chrono::Duration::minutes(30);
+            let status = if health_data.timestamp > threshold {
                 "healthy"
             } else {
                 "unhealthy"
@@ -84,8 +83,12 @@ pub async fn start_api_server(router: Router) -> Result<(), Box<dyn std::error::
     let port = std::env::var("API_PORT").unwrap_or_else(|_| API_PORT.to_string());
     let addr = format!("0.0.0.0:{}", port);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Parse the address properly
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
+
+    let listener = tokio::net::TcpListener::bind(socket_addr).await?;
     tracing::info!("API server listening on http://{}", addr);
+    tracing::info!("🌐 Server is externally reachable on port {}", port);
 
     axum::serve(listener, router).await?;
     Ok(())
