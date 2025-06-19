@@ -1,106 +1,253 @@
 use anyhow::Result;
-use hex;
-use serde_json::json;
-use sp1_sdk::SP1ProofWithPublicValues;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{error, info, warn};
 
-/// Endpoint for the Helios prover service
-const HELIOS_PROVER_ENDPOINT: &str = "http://165.1.70.239:7778/";
+use crate::api::{create_api_server, start_api_server};
+use crate::config::{LIGHT_CLIENT_MODE, MODE};
+use crate::db::{Database, HealthCheckData, PreviousProof};
+use crate::relayer::get_proof;
+#[cfg(all(feature = "relayer", not(feature = "health-check")))]
+use crate::relayer::{create_payload, send};
+mod api;
+mod config;
+mod db;
+mod relayer;
 
-/// Endpoint for the registry service
-const REGISTRY_ENDPOINT: &str =
-    "http://prover.timewave.computer:37281/api/registry/domain/ethereum-alpha";
+use helios_recursion_types::WrapperCircuitOutputs as HeliosWrapperCircuitOutputs;
+use tendermint_recursion_types::WrapperCircuitOutputs as TendermintWrapperCircuitOutputs;
 
-pub async fn get_helios_block() -> Result<SP1ProofWithPublicValues, anyhow::Error> {
-    let client = reqwest::Client::new();
-    let response = client.get(HELIOS_PROVER_ENDPOINT).send().await.unwrap();
-    let hex_str = response.text().await.unwrap();
-    let bytes = hex::decode(hex_str)?;
-    let state_proof: SP1ProofWithPublicValues = serde_json::from_slice(&bytes)?;
-    Ok(state_proof)
-}
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    // Initialize tracing subscriber with proper configuration
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .init();
 
-pub async fn create_payload() -> Result<serde_json::Value, anyhow::Error> {
-    let helios_block = get_helios_block().await?;
-    let helios_block_proof = hex::encode(helios_block.bytes());
-    let helios_block_public_values = hex::encode(helios_block.public_values.to_vec());
-    let helios_block_vk = "0x006beadaace48146e0389403f70b490980e612c439a9294877446cd583e50fce";
+    info!("🚀 Starting Helios Proof Relayer...");
 
-    let payload = json!({
-        "proof": helios_block_proof,
-        "public_values": helios_block_public_values,
-        "vk": helios_block_vk,
-    });
+    #[cfg(all(feature = "relayer", not(feature = "health-check")))]
+    {
+        info!("📡 Running in relayer mode");
+        // Initialize database
+        let db = std::sync::Arc::new(Database::new("relayer.db")?);
 
-    Ok(payload)
-}
+        // Load previous proof from database if it exists
+        let mut previous_proof: Option<String> = match db.get_previous_proof()? {
+            Some(proof) => Some(proof.proof_data),
+            None => None,
+        };
 
-pub async fn send(payload: &serde_json::Value) -> Result<(), anyhow::Error> {
-    println!("Payload: {:?}", payload);
+        // Start the relayer loop
+        loop {
+            match create_payload().await {
+                Ok(payload) => {
+                    // Extract the proof from the payload to compare
+                    let current_proof = payload["proof"].as_str().unwrap().to_string();
 
-    let client = reqwest::Client::new();
-    let response = client.post(REGISTRY_ENDPOINT).json(payload).send().await?;
+                    // Check if this proof is different from the previous one
+                    let should_send = match &previous_proof {
+                        None => true,
+                        Some(prev) => {
+                            if prev != &current_proof {
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
 
-    println!("Response status: {}", response.status());
-    let response_text = response.text().await?;
-    println!("Response body: {}", response_text);
+                    if should_send {
+                        match send(&payload).await {
+                            Ok(_) => {
+                                info!("✅ Successfully sent payload to registry");
+                                previous_proof = Some(current_proof.clone());
+
+                                // Store the new proof in database
+                                let proof_data = PreviousProof {
+                                    proof_data: current_proof,
+                                    timestamp: chrono::Utc::now(),
+                                };
+                                if let Err(e) = db.update_previous_proof(&proof_data) {
+                                    error!("❌ Failed to update previous proof in database: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to send payload to registry: {}", e);
+                            }
+                        }
+                    } else {
+                        info!("⏳ Waiting for next check...");
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to create payload: {}", e);
+                }
+            }
+            sleep(Duration::from_secs(30)).await;
+        }
+    }
+
+    #[cfg(any(feature = "health-check", not(feature = "relayer")))]
+    {
+        info!("🏥 Running in health-check mode");
+
+        // Initialize database
+        info!("💾 Initializing database...");
+        let db = std::sync::Arc::new(Database::new("health_check.db")?);
+        info!("✅ Database initialized successfully");
+
+        // Clear database for testing
+        info!("🧹 Clearing database tables for fresh start...");
+        if let Err(e) = db.clear_all_tables() {
+            warn!("⚠️  Failed to clear database tables: {}", e);
+        } else {
+            info!("✅ Database tables cleared successfully");
+        }
+
+        // Create API server
+        info!("🌐 Creating API server...");
+        let api_router = create_api_server(db.clone());
+        info!("✅ API server created");
+
+        // Start the health check loop in a separate task
+        info!("🔍 Starting health check service...");
+        let health_check_handle = tokio::spawn(async move {
+            info!("✅ Health check service started");
+
+            loop {
+                info!("🔍 Fetching latest proof...");
+                match get_proof().await {
+                    Ok(proof) => {
+                        info!("✅ Proof fetched successfully");
+
+                        // Get previous proof from database
+                        let previous_proof = match db.get_previous_proof() {
+                            Ok(Some(prev)) => Some(prev.proof_data),
+                            Ok(None) => None,
+                            Err(e) => {
+                                warn!("⚠️  Error getting previous proof from database: {}", e);
+                                None
+                            }
+                        };
+
+                        // Check if proof has changed
+                        let current_proof_hex = hex::encode(proof.bytes());
+                        let should_update = match &previous_proof {
+                            None => {
+                                info!("🆕 No previous proof found, processing new proof");
+                                true
+                            }
+                            Some(prev) => {
+                                if prev != &current_proof_hex {
+                                    info!("🔄 Proof has changed, processing new proof");
+                                    true
+                                } else {
+                                    info!("⏳ Proof unchanged, skipping update");
+                                    sleep(Duration::from_secs(120)).await;
+                                    continue;
+                                }
+                            }
+                        };
+
+                        if should_update {
+                            let mut current_height: u64 = 0;
+                            let mut current_root: [u8; 32] = [0; 32];
+
+                            match LIGHT_CLIENT_MODE {
+                                MODE::HELIOS => {
+                                    let public_outputs: HeliosWrapperCircuitOutputs =
+                                        borsh::from_slice(&proof.public_values.as_slice()).unwrap();
+                                    current_height = public_outputs.height;
+                                    current_root = public_outputs.root;
+                                }
+                                MODE::TENDERMINT => {
+                                    let public_outputs: TendermintWrapperCircuitOutputs =
+                                        borsh::from_slice(proof.public_values.as_slice()).unwrap();
+                                    current_height = public_outputs.height;
+                                    current_root = public_outputs.root;
+                                }
+                            }
+
+                            info!(
+                                "📊 Processing proof - Height: {}, Root: {}",
+                                current_height,
+                                hex::encode(current_root)
+                            );
+
+                            // Store health check data in database when proof changes
+                            let health_data = HealthCheckData {
+                                current_height,
+                                current_root: current_root.to_vec(),
+                                timestamp: chrono::Utc::now(),
+                            };
+
+                            if let Err(e) = db.update_health_check(&health_data) {
+                                error!("❌ Failed to update health check data in database: {}", e);
+                            } else {
+                                info!(
+                                    "💾 Health check data updated - Height: {}, Root: {}",
+                                    current_height,
+                                    hex::encode(current_root)
+                                );
+                            }
+
+                            // Store the new proof in database
+                            let proof_data = PreviousProof {
+                                proof_data: current_proof_hex,
+                                timestamp: chrono::Utc::now(),
+                            };
+                            if let Err(e) = db.update_previous_proof(&proof_data) {
+                                error!("❌ Failed to update previous proof in database: {}", e);
+                            } else {
+                                info!("💾 Proof stored in database");
+                            }
+
+                            info!("⏰ Waiting 120 seconds before next check...");
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ Health check failed: {}", e);
+                    }
+                }
+                // Wait 2 minutes before next health check
+                sleep(Duration::from_secs(120)).await;
+            }
+        });
+
+        // Start the API server in a separate task
+        info!("🌐 Starting API server...");
+        let api_handle = tokio::spawn(async move {
+            info!("✅ API server started");
+            if let Err(e) = start_api_server(api_router).await {
+                error!("❌ API server error: {}", e);
+            }
+        });
+
+        info!("🔄 Waiting for services to complete...");
+        // Wait for both tasks to conclude
+        let (health_check_result, api_result) = tokio::join!(health_check_handle, api_handle);
+
+        // Handle any errors from the tasks
+        if let Err(e) = health_check_result {
+            error!("❌ Health check service crashed: {}", e);
+            return Err(anyhow::anyhow!("{}", e));
+        }
+
+        if let Err(e) = api_result {
+            error!("❌ API server crashed: {}", e);
+            return Err(anyhow::anyhow!("{}", e));
+        }
+    }
 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let mut previous_proof: Option<String> = None;
-
-    loop {
-        match create_payload().await {
-            Ok(payload) => {
-                // Extract the proof from the payload to compare
-                let current_proof = payload["proof"].as_str().unwrap().to_string();
-
-                // Check if this proof is different from the previous one
-                let should_send = match &previous_proof {
-                    None => {
-                        println!("First run - sending initial proof");
-                        true
-                    }
-                    Some(prev) => {
-                        if prev != &current_proof {
-                            println!("Proof has changed - sending updated proof");
-                            true
-                        } else {
-                            println!("Proof unchanged - skipping POST request");
-                            false
-                        }
-                    }
-                };
-
-                if should_send {
-                    match send(&payload).await {
-                        Ok(_) => {
-                            println!("Successfully sent payload to registry");
-                            previous_proof = Some(current_proof);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to send payload to registry: {}", e);
-                        }
-                    }
-                } else {
-                    println!("Waiting for next check...");
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to create payload: {}", e);
-            }
-        }
-
-        // Wait 30 seconds before checking again
-        sleep(Duration::from_secs(30)).await;
-    }
-}
-
 #[cfg(test)]
+#[cfg(all(feature = "relayer", not(feature = "health-check")))]
 mod tests {
     use crate::create_payload;
 
@@ -108,6 +255,6 @@ mod tests {
     async fn test_get_latest_helios_block() {
         // get and validate a helios block
         let payload = create_payload().await.unwrap();
-        println!("Payload: {:?}", payload);
+        info!("Payload: {:?}", payload);
     }
 }

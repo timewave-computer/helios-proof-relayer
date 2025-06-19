@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.cargo.features": [
+        "relayer",
+        "health-check"
+    ],
+    "rust-analyzer.cargo.noDefaultFeatures": true
+}
