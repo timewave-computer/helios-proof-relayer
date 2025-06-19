@@ -39,14 +39,14 @@ CREATE TABLE previous_proof (
 
 ## Usage
 
-### Run in Relayer Mode (default)
+### Run in Relayer Mode
 ```bash
-cargo run
+cargo run --no-default-features --features relayer
 ```
 
-### Run in Health Check Mode
+### Run in Health Check Mode (default)
 ```bash
-cargo run --features health-check
+cargo run
 ```
 
 ## Database Files
