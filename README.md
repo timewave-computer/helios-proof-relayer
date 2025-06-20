@@ -1,6 +1,6 @@
 # Lightwave Relayer
 
-A Rust application that relays proofs to a registry and performs health checks on light client data.
+A Rust application that relays proofs to a registry and performs health checks on [lightwave](https://github.com/timewave-computer/lightwave).
 
 ## Features
 
